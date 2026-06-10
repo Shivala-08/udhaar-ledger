@@ -41,6 +41,17 @@ You can explicitly add a customer to your database with their phone number to ke
 
 ---
 
+## 👥 Customer WhatsApp Guide (ग्राहक गाइड)
+
+If your phone number is registered by a shopkeeper, you can interact with the bot directly on WhatsApp:
+* **Auto-Notifications:** Every time a shopkeeper logs a credit for you, you will receive an automatic WhatsApp notification with the credit amount, your current total balance, and a read-only PWA ledger link.
+* **Check Balance (`HISAB`):** Send `HISAB` to see a summary of all active shop balances and their respective ledger links.
+* **Raise a Dispute (`GALAT <Amount>`):** If you notice a wrong entry, send `GALAT <Amount>` (e.g. `GALAT 150`). This will:
+  1. Flag the last matching credit transaction as disputed in the database.
+  2. Send an alert warning to the shopkeeper's phone.
+
+---
+
 ## 🛠️ Developer Setup & Technical Documentation
 
 This backend is built on Node.js + Express and integrates with Supabase for the database, OpenRouter (Llama 3 8B) for natural language parsing, and Twilio for incoming WhatsApp webhook messages.
@@ -75,12 +86,20 @@ SUPABASE_URL=https://<your-project-id>.supabase.co
 SUPABASE_KEY=<your-service-role-key>
 OPENROUTER_API_KEY=<your-openrouter-key>
 SKIP_TWILIO_VALIDATION=true
+PUBLIC_APP_URL=http://localhost:3000
 ```
 *(Setting `SKIP_TWILIO_VALIDATION=true` enables local webhook testing via curl/ngrok without signature mismatches)*.
 
 #### Step 2: Database Schema & Migration
-Apply the migrations schema located in [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql). 
+Apply the migrations schemas located in [supabase/migrations/](supabase/migrations/).
 
+1. Run the initial schema migration `0001_init.sql`.
+2. Run the second migration `0002_add_disputes_and_tokens.sql` to support disputes and access tokens:
+```sql
+ALTER TABLE public.transactions ADD COLUMN IF NOT EXISTS is_disputed boolean not null default false;
+ALTER TABLE public.shopkeeper_customers ADD COLUMN IF NOT EXISTS access_token text unique default gen_random_uuid()::text;
+UPDATE public.shopkeeper_customers SET access_token = gen_random_uuid()::text WHERE access_token IS NULL;
+```
 Ensure the check constraint limiting outstanding balances to non-negative numbers is dropped:
 ```sql
 ALTER TABLE public.shopkeeper_customers DROP CONSTRAINT IF EXISTS shopkeeper_customers_balance_nonneg;
