@@ -1,0 +1,19 @@
+{
+  "name": "udhaar-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp-first micro-credit ledger app backend for Udhaar",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.43.4",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.5.2",
+    "helmet": "^8.2.0",
+    "twilio": "^5.1.0"
+  }
+}
