@@ -253,8 +253,21 @@ router.post('/whatsapp', validateTwilioSignature, async (req, res) => {
       return res.type('text/xml').send(twiml(welcomeUnregisteredMessage()))
     }
 
-    // Step 3 — Parse message intent via LLM
-    const parsed = await parseMessage(bodyVal)
+    // Step 3 — Try local parsing first to avoid LLM latency (~1-2 seconds)
+    let parsed = fallbackParseMessage(bodyVal)
+
+    // If local parsing is not confident or missing required fields, fall back to LLM
+    const needsLLM =
+      parsed.intent === 'unknown' ||
+      ((parsed.intent === 'credit' || parsed.intent === 'repayment') && (!parsed.name || !parsed.amount)) ||
+      (parsed.intent === 'new_customer' && (!parsed.name && !parsed.phone))
+
+    if (needsLLM) {
+      console.log('[Webhook] Local parse failed or incomplete. Falling back to LLM parsing...')
+      parsed = await parseMessage(bodyVal)
+    } else {
+      console.log(`[Webhook] Success! Parsed locally in <1ms (Intent: ${parsed.intent})`)
+    }
 
     // Step 4 — Route to handler by intent
     let replyMessage = ''
@@ -355,25 +368,31 @@ function fallbackParseMessage(text) {
   let phone = null
   let note = null
 
-  // 1. Identify intent
-  if (lower.includes('udhaar') || lower.includes('udhar') || lower.includes('credit')) {
+  // 1. Identify intent with flexible aliases
+  const creditKeywords = ['udhaar', 'udhar', 'credit', 'cr', 'le gaya', 'diya', 'de diya']
+  const repaymentKeywords = ['wapas', 'vapas', 'paid', 'payment', 'pay', 'dr', 'rec', 'received', 'chukaya', 'bheja']
+  const balanceKeywords = ['kitna', 'baaki', 'hisab', 'balance', 'bal', 'due', 'bata']
+  const newCustKeywords = ['naya', 'new', 'add', 'jodo', 'customer', 'cust']
+  const listKeywords = ['list', 'help', 'commands', 'features', 'menu', 'kya kare']
+
+  if (creditKeywords.some(kw => lower.includes(kw))) {
     intent = 'credit'
-  } else if (lower.includes('wapas') || lower.includes('vapas') || lower.includes('paid') || lower.includes('payment') || lower.includes('chukaya')) {
+  } else if (repaymentKeywords.some(kw => lower.includes(kw))) {
     intent = 'repayment'
-  } else if (lower.includes('kitna') || lower.includes('baaki') || lower.includes('hisab') || lower.includes('balance') || lower.includes('due')) {
+  } else if (balanceKeywords.some(kw => lower.includes(kw))) {
     intent = 'balance'
-  } else if (lower.includes('naya') || lower.includes('new') || lower.includes('add') || lower.includes('jodo')) {
+  } else if (newCustKeywords.some(kw => lower.includes(kw))) {
     intent = 'new_customer'
-  } else if (lower.includes('list') || lower.includes('help') || lower.includes('commands')) {
+  } else if (listKeywords.some(kw => lower.includes(kw))) {
     intent = 'list'
   }
 
   // 2. Extract name (typically the first word, if it's alphabetic and not a command keyword)
   const words = cleanText.split(/\s+/)
-  const keywords = ['register', 'udhaar', 'udhar', 'credit', 'wapas', 'vapas', 'paid', 'payment', 'chukaya', 'kitna', 'baaki', 'hisab', 'balance', 'due', 'naya', 'new', 'add', 'jodo', 'customer', 'ne', 'ko', 'ka']
+  const allKeywords = [...creditKeywords, ...repaymentKeywords, ...balanceKeywords, ...newCustKeywords, ...listKeywords, 'ne', 'ko', 'ka', 'ki', 'ke']
   for (const word of words) {
     const cleanWord = word.replace(/[^a-zA-Z]/g, '')
-    if (cleanWord && !keywords.includes(cleanWord.toLowerCase())) {
+    if (cleanWord && !allKeywords.includes(cleanWord.toLowerCase())) {
       name = cleanWord
       break
     }
@@ -400,8 +419,13 @@ function fallbackParseMessage(text) {
     if (indexAmount !== -1) {
       const remaining = cleanText.slice(indexAmount + amountStr.length).trim()
       // Remove intent keyword (e.g. udhaar, wapas)
-      const keywordRegex = /\b(udhaar|udhar|credit|wapas|vapas|paid|payment)\b/i
-      const cleanRemaining = remaining.replace(keywordRegex, '').trim()
+      const allIntentsKeywords = [...creditKeywords, ...repaymentKeywords]
+      let cleanRemaining = remaining
+      for (const kw of allIntentsKeywords) {
+        const regex = new RegExp(`\\b${kw}\\b`, 'gi')
+        cleanRemaining = cleanRemaining.replace(regex, '')
+      }
+      cleanRemaining = cleanRemaining.replace(/\s+/g, ' ').trim()
       if (cleanRemaining) {
         note = cleanRemaining
       }
@@ -532,7 +556,7 @@ async function handleCredit(parsed, shopkeeper) {
   // Fire-and-forget
   analyzeRepaymentPattern(sc.id).catch(console.error)
 
-  return `✓ ${customer.name} ko ₹${safeAmount} udhaar diya.\n${customer.name} ka total baaki: ₹${newBalance}`
+  return `✅ *Khata Updated (उधार जोड़ा गया)*\n\n👤 *Customer:* ${customer.name}\n➕ *Naya Udhaar:* ₹${safeAmount}\n🗒️ *Note:* ${parsed.note || 'N/A'}\n\n📉 *Total Baaki (Outstanding):* ₹${newBalance}`
 }
 
 /**
@@ -619,13 +643,17 @@ async function handleRepayment(parsed, shopkeeper) {
     .then(() => scheduleNudge(sc.id))
     .catch(console.error)
 
-  let reply = ''
+  let reply = `🙏 *Payment Received (पेमेंट मिला)*\n\n👤 *Customer:* ${customer.name}\n➖ *Amount Paid:* ₹${safeAmount}\n`
+  if (parsed.note) {
+    reply += `🗒️ *Note:* ${parsed.note}\n`
+  }
+  reply += `\n`
   if (newBalance < 0) {
-    reply = `✓ ${customer.name} ne ₹${safeAmount} diya. Shukriya!\n${customer.name} ka ₹${Math.abs(newBalance)} jama (advance) ho gaya.`
+    reply += `💰 *${customer.name} ka Advance (Jama):* ₹${Math.abs(newBalance)}`
   } else {
-    reply = `✓ ${customer.name} ne ₹${safeAmount} diya. Shukriya!\n${customer.name} ka baaki: ₹${newBalance}`
+    reply += `📉 *Abhi ka Baaki:* ₹${newBalance}`
     if (newBalance === 0) {
-      reply += '\nSaara hisab saaf! 🎉'
+      reply += `\n\n🎉 *Saara hisab saaf! Mubarak ho!*`
     }
   }
   return reply
@@ -676,13 +704,13 @@ async function handleBalance(parsed, shopkeeper) {
 
     const balance = sc.outstanding_balance ? Number(sc.outstanding_balance) : 0
     if (balance === 0) {
-      return `${customer.name} ka koi baaki nahi hai.`
+      return `📊 *${customer.name} ka Hisab*\n\n✅ Koi baaki nahi hai (All clear!).`
     }
     if (balance < 0) {
-      return `${customer.name} ka ₹${Math.abs(balance)} jama (advance) hai.`
+      return `📊 *${customer.name} ka Hisab*\n\n💰 *Advance (Jama):* ₹${Math.abs(balance)}\n\n_(Aap par unka ₹${Math.abs(balance)} jama hai)_`
     }
 
-    return `${customer.name} ka baaki: ₹${balance}`
+    return `📊 *${customer.name} ka Hisab*\n\n📉 *Total Baaki (Dues):* ₹${balance}`
   }
 
   // Case B — all customers
@@ -715,10 +743,10 @@ async function handleBalance(parsed, shopkeeper) {
     const bal = record.outstanding_balance ? Number(record.outstanding_balance) : 0
     totalSum += bal
     const custName = record.customers?.name || 'Unknown'
-    accountsList.push(`• ${custName} — ₹${bal}`)
+    accountsList.push(`• *${custName}* — ₹${bal}`)
   }
 
-  return `Aapke baaki accounts:\n${accountsList.join('\n')}\n\nTotal: ₹${totalSum}`
+  return `📊 *Ledger Summary (कुल बकाया list)*\n\n${accountsList.join('\n')}\n\n━━━━━━━━━━━━━━\n💰 *Grand Total (कुल बाकी):* ₹${totalSum}`
 }
 
 /**
@@ -835,7 +863,7 @@ async function handleNewCustomer(parsed, shopkeeper) {
     return 'Kuch gadbad ho gayi. Thodi der baad try karein.'
   }
 
-  return `✓ ${newCustomer.name} add ho gaya. Ab unka udhaar shuru kar sakte hain.\nExample: ${newCustomer.name} 100 udhaar`
+  return `👤 *Naya Customer Registered!*\n\n👤 *Name:* ${newCustomer.name}\n📞 *Phone:* ${newCustomer.phone || 'N/A'}\n\nAb aap inka udhaar register kar sakte hain.\n👉 *Example:* "${newCustomer.name} 100 udhaar"`
 }
 
 /**
