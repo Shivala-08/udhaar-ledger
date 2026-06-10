@@ -1,5 +1,6 @@
 import express from 'express'
 import twilio from 'twilio'
+import crypto from 'crypto'
 import { supabase } from '../lib/supabase.js'
 import { openrouter } from '../lib/openrouter.js'
 import { analyzeRepaymentPattern } from '../services/analyzePattern.js'
@@ -242,13 +243,40 @@ router.post('/whatsapp', validateTwilioSignature, async (req, res) => {
       return res.type('text/xml').send(twiml(reply))
     }
 
-    // Step 2b — List / help command (no LLM call).
+    // Step 2b — Customer Flow
+    if (!shopkeeper) {
+      // Check if they are a registered customer
+      const { data: customer, error: custError } = await supabase
+        .from('customers')
+        .select('id, name, phone')
+        .eq('phone', shopkeeperPhone)
+        .maybeSingle()
+
+      if (custError) {
+        console.error('Supabase error fetching customer:', custError)
+        return res.type('text/xml').send(twiml('Kuch gadbad ho gayi. Thodi der baad try karein.'))
+      }
+
+      if (customer) {
+        let replyMessage = ''
+        const lowerBody = bodyVal.trim().toLowerCase()
+        if (lowerBody.includes('hisab')) {
+          replyMessage = await handleCustomerHisab(customer)
+        } else if (lowerBody.startsWith('galat')) {
+          replyMessage = await handleCustomerDispute(customer, bodyVal)
+        } else {
+          replyMessage = `Namaste ${customer.name}!\n\nAap niche diye commands bhej sakte hain:\n\n👉 *HISAB*: Apna total balance aur ledger links dekhne ke liye.\n👉 *GALAT <amount>*: Kisi galat credit entry ki shikayat ke liye (e.g. *GALAT 150*)`
+        }
+        return res.type('text/xml').send(twiml(replyMessage))
+      }
+    }
+
+    // Step 2c — List / help command for shopkeeper (no LLM call).
     if (isListCommand(bodyVal)) {
       return res.type('text/xml').send(twiml(handleList()))
     }
 
-    // Step 2c — Unknown number sending anything other than `register ...` or `list`:
-    // welcome them and tell them how to register. No LLM call, no DB writes.
+    // Step 2d — Unregistered sender: welcome registration message
     if (!shopkeeper) {
       return res.type('text/xml').send(twiml(welcomeUnregisteredMessage()))
     }
@@ -490,7 +518,7 @@ async function handleCredit(parsed, shopkeeper) {
   // Find or create shopkeeper_customers row
   let { data: sc, error: scError } = await supabase
     .from('shopkeeper_customers')
-    .select('id, outstanding_balance')
+    .select('id, outstanding_balance, access_token')
     .eq('shopkeeper_id', shopkeeper.id)
     .eq('customer_id', customer.id)
     .maybeSingle()
@@ -501,6 +529,7 @@ async function handleCredit(parsed, shopkeeper) {
   }
 
   if (!sc) {
+    const token = crypto.randomUUID()
     const { data: newSc, error: insertScError } = await supabase
       .from('shopkeeper_customers')
       .insert({
@@ -508,7 +537,8 @@ async function handleCredit(parsed, shopkeeper) {
         customer_id: customer.id,
         outstanding_balance: 0,
         status: 'active',
-        last_activity_at: new Date().toISOString()
+        last_activity_at: new Date().toISOString(),
+        access_token: token
       })
       .select()
       .single()
@@ -551,6 +581,24 @@ async function handleCredit(parsed, shopkeeper) {
   if (updateScError) {
     console.error('Supabase error updating shopkeeper_customers in handleCredit:', updateScError)
     return 'Kuch gadbad ho gayi. Thodi der baad try karein.'
+  }
+
+  // Ensure access_token is set
+  let token = sc.access_token
+  if (!token) {
+    token = crypto.randomUUID()
+    await supabase
+      .from('shopkeeper_customers')
+      .update({ access_token: token })
+      .eq('id', sc.id)
+  }
+
+  // Trigger customer auto-notification
+  if (customer.phone) {
+    const publicUrl = process.env.PUBLIC_APP_URL || 'http://localhost:3000'
+    const notifyBody = `Namaste! ${shopkeeper.shop_name || 'Shop'} pe aapka ₹${safeAmount} udhaar hua.\nTotal baaki: ₹${newBalance}\nLedger Link: ${publicUrl}/c/${token}\nReply HISAB for full history.`
+    
+    sendWhatsAppMessage(`whatsapp:+91${customer.phone}`, notifyBody).catch(console.error)
   }
 
   // Fire-and-forget
@@ -887,6 +935,158 @@ Naya customer add:
 
 Sab features dekhne ke liye:
   list`
+}
+
+/**
+ * Resolves all customer relationship records and compiles a nice WhatsApp statement.
+ */
+async function handleCustomerHisab(customer) {
+  const { data: records, error: recordsError } = await supabase
+    .from('shopkeeper_customers')
+    .select(`
+      outstanding_balance,
+      access_token,
+      shopkeeper_id,
+      shopkeepers (
+        name,
+        shop_name
+      )
+    `)
+    .eq('customer_id', customer.id)
+
+  if (recordsError) {
+    console.error('Supabase error fetching shopkeeper relationships:', recordsError)
+    return 'Kuch gadbad ho gayi. Thodi der baad try karein.'
+  }
+
+  if (!records || records.length === 0) {
+    return `Namaste ${customer.name}! Aapka kisi bhi shopkeeper ke paas account nahi hai.`
+  }
+
+  let reply = `📊 *Aapka Hisab Summary*\n\n`
+  const lines = []
+  
+  const publicUrl = process.env.PUBLIC_APP_URL || 'http://localhost:3000'
+
+  for (const record of records) {
+    const bal = Number(record.outstanding_balance) || 0
+    const shopName = record.shopkeepers?.shop_name || 'Kirana Shop'
+    const skName = record.shopkeepers?.name || 'Shopkeeper'
+    
+    // Auto-generate token if missing
+    let token = record.access_token
+    if (!token) {
+      token = crypto.randomUUID()
+      await supabase
+        .from('shopkeeper_customers')
+        .update({ access_token: token })
+        .eq('shopkeeper_id', record.shopkeeper_id)
+        .eq('customer_id', customer.id)
+    }
+    
+    let balStr = ''
+    if (bal < 0) {
+      balStr = `₹${Math.abs(bal)} Advance (Jama)`
+    } else {
+      balStr = `₹${bal} Baaki`
+    }
+    
+    lines.push(`🏪 *${shopName}* (by ${skName})\n💰 ${balStr}\n🔗 Ledger: ${publicUrl}/c/${token}`)
+  }
+
+  reply += lines.join('\n\n')
+  return reply
+}
+
+/**
+ * Handles a customer dispute submission by updating the transaction's is_disputed flag.
+ */
+async function handleCustomerDispute(customer, text) {
+  const match = text.trim().match(/^galat\s+(\d+)$/i)
+  if (!match) {
+    return 'Dispute format sahi nahi hai. Example: GALAT 150'
+  }
+  const amount = parseInt(match[1], 10)
+  if (isNaN(amount) || amount <= 0) {
+    return 'Amount sahi nahi hai. Example: GALAT 150'
+  }
+
+  // 1. Get all customer relationships
+  const { data: relations, error: relError } = await supabase
+    .from('shopkeeper_customers')
+    .select('id, shopkeeper_id, shopkeepers(phone, name, shop_name)')
+    .eq('customer_id', customer.id)
+
+  if (relError || !relations || relations.length === 0) {
+    console.error('Error loading customer relationships for dispute:', relError)
+    return 'Aapka kisi bhi shopkeeper ke sath account nahi hai.'
+  }
+
+  // 2. Find the last matching credit transaction
+  const relIds = relations.map(r => r.id)
+  const { data: txs, error: txError } = await supabase
+    .from('transactions')
+    .select('id, shopkeeper_customer_id, amount, transacted_at')
+    .in('shopkeeper_customer_id', relIds)
+    .eq('type', 'credit')
+    .eq('amount', amount)
+    .order('transacted_at', { ascending: false })
+    .limit(1)
+
+  if (txError) {
+    console.error('Supabase error loading transactions for dispute:', txError)
+    return 'Kuch gadbad ho gayi. Thodi der baad try karein.'
+  }
+
+  if (!txs || txs.length === 0) {
+    return `Aapke accounts mein ₹${amount} ki koi credit entry nahi mili.`
+  }
+
+  const disputedTx = txs[0]
+  
+  // 3. Update transaction dispute flag
+  const { error: updError } = await supabase
+    .from('transactions')
+    .update({ is_disputed: true })
+    .eq('id', disputedTx.id)
+
+  if (updError) {
+    console.error('Supabase error updating transaction dispute flag:', updError)
+    return 'Kuch gadbad ho gayi. Thodi der baad try karein.'
+  }
+
+  // 4. Notify the shopkeeper via WhatsApp
+  const rel = relations.find(r => r.id === disputedTx.shopkeeper_customer_id)
+  const shopkeeperPhone = rel?.shopkeepers?.phone
+  const shopName = rel?.shopkeepers?.shop_name || 'Shop'
+
+  if (shopkeeperPhone) {
+    const notifyBody = `⚠️ *Dispute Raised (शिकायत)*\n\nCustomer *${customer.name}* ne ₹${amount} ke credit entry ko flag kiya hai.\n\nHisab check karein.`
+    sendWhatsAppMessage(`whatsapp:+91${shopkeeperPhone}`, notifyBody).catch(console.error)
+  }
+
+  return `✓ ₹${amount} ke credit entry ki shikayat (dispute) दर्ज ho gayi hai. Shopkeeper (${shopName}) ko update kar diya gaya hai.`
+}
+
+/**
+ * Helper utility to send real WhatsApp messages via Twilio, falling back to mock logs if missing keys.
+ */
+async function sendWhatsAppMessage(to, body) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID
+  const authToken = process.env.TWILIO_AUTH_TOKEN
+  const from = process.env.TWILIO_FROM || 'whatsapp:+14155238886'
+
+  if (!accountSid || !authToken) {
+    console.log(`[Twilio Mock Send] To: ${to}, From: ${from}, Body:\n${body}`)
+    return { sid: 'mock-sid-' + Math.random().toString(36).substr(2, 9) }
+  }
+
+  const client = twilio(accountSid, authToken)
+  return await client.messages.create({
+    to,
+    from,
+    body
+  })
 }
 
 /**
